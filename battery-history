@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""battery-history — historical battery usage for macOS.
+
+Data sources (no third-party dependencies):
+  * `pmset -g log`            -> charge % samples over time (weeks of history)
+  * `system_profiler SPPowerDataType` -> current health / adapter
+
+Everything is derived from the "Using AC/Batt(Charge: N)" samples that
+macOS power management writes to its log.
+"""
+
+import argparse
+import datetime as dt
+import json
+import re
+import subprocess
+import sys
+
+SAMPLE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) ([-+]\d{4}).*?"
+    r"Using (AC|Batt)\(Charge:\s*(\d+)"
+)
+
+BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def run(cmd):
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=60
+        )
+        return out.stdout
+    except Exception as exc:  # noqa: BLE001
+        print(f"failed to run {' '.join(cmd)}: {exc}", file=sys.stderr)
+        return ""
+
+
+def parse_samples(text):
+    samples = []
+    for line in text.splitlines():
+        m = SAMPLE_RE.match(line)
+        if not m:
+            continue
+        date_s, time_s, tz_s, source, charge = m.groups()
+        stamp = dt.datetime.strptime(
+            f"{date_s} {time_s} {tz_s}", "%Y-%m-%d %H:%M:%S %z"
+        )
+        samples.append(
+            {"t": stamp, "source": source, "charge": int(charge)}
+        )
+    samples.sort(key=lambda s: s["t"])
+    return samples
+
+
+def build_sessions(samples):
+    """Group consecutive samples that share a power source."""
+    sessions = []
+    cur = None
+    for s in samples:
+        if cur is None or s["source"] != cur["source"]:
+            if cur is not None:
+                sessions.append(cur)
+            cur = {
+                "source": s["source"],
+                "start": s["t"],
+                "end": s["t"],
+                "start_charge": s["charge"],
+                "end_charge": s["charge"],
+                "min_charge": s["charge"],
+                "max_charge": s["charge"],
+                "n": 1,
+            }
+        else:
+            cur["end"] = s["t"]
+            cur["end_charge"] = s["charge"]
+            cur["min_charge"] = min(cur["min_charge"], s["charge"])
+            cur["max_charge"] = max(cur["max_charge"], s["charge"])
+            cur["n"] += 1
+    if cur is not None:
+        sessions.append(cur)
+    for se in sessions:
+        se["dur_h"] = (se["end"] - se["start"]).total_seconds() / 3600.0
+        se["delta"] = se["end_charge"] - se["start_charge"]
+        se["rate"] = se["delta"] / se["dur_h"] if se["dur_h"] > 0 else 0.0
+    return sessions
+
+
+def parse_health(text):
+    keys = {
+        "Cycle Count": "cycle_count",
+        "Condition": "condition",
+        "Maximum Capacity": "max_capacity",
+        "State of Charge (%)": "charge",
+        "Charging": "charging",
+        "Fully Charged": "fully_charged",
+    }
+    health = {}
+    adapter = {}
+    in_adapter = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if "AC Charger Information" in line:
+            in_adapter = True
+        for label, key in keys.items():
+            if stripped.startswith(label + ":"):
+                health[key] = stripped.split(":", 1)[1].strip()
+        if in_adapter:
+            if stripped.startswith("Connected:"):
+                adapter["connected"] = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("Wattage (W):"):
+                adapter["wattage"] = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("Name:"):
+                adapter["name"] = stripped.split(":", 1)[1].strip()
+    health["adapter"] = adapter
+    return health
+
+
+def daily_rollup(sessions):
+    """Per calendar day: time on battery, % drained, min charge."""
+    days = {}
+    for se in sessions:
+        day = se["start"].date().isoformat()
+        d = days.setdefault(
+            day,
+            {"batt_h": 0.0, "drained": 0.0, "charged": 0.0,
+             "min": 100, "max": 0},
+        )
+        d["min"] = min(d["min"], se["min_charge"])
+        d["max"] = max(d["max"], se["max_charge"])
+        if se["source"] == "Batt":
+            d["batt_h"] += se["dur_h"]
+            if se["delta"] < 0:
+                d["drained"] += -se["delta"]
+        else:
+            if se["delta"] > 0:
+                d["charged"] += se["delta"]
+    return days
+
+
+def sparkline(samples, width=60):
+    if not samples:
+        return "", ""
+    start = samples[0]["t"]
+    end = samples[-1]["t"]
+    span = (end - start).total_seconds() or 1
+    buckets = [[] for _ in range(width)]
+    srcbuckets = [[] for _ in range(width)]
+    for s in samples:
+        idx = int((s["t"] - start).total_seconds() / span * (width - 1))
+        idx = max(0, min(width - 1, idx))
+        buckets[idx].append(s["charge"])
+        srcbuckets[idx].append(s["source"])
+    charge_row = []
+    src_row = []
+    last = 0
+    for i in range(width):
+        if buckets[i]:
+            avg = sum(buckets[i]) / len(buckets[i])
+            last = avg
+        else:
+            avg = last
+        level = int(round(avg / 100 * (len(BLOCKS) - 1)))
+        charge_row.append(BLOCKS[level])
+        if srcbuckets[i]:
+            src_row.append("A" if srcbuckets[i][-1] == "AC" else "B")
+        else:
+            src_row.append(" ")
+    return "".join(charge_row), "".join(src_row)
+
+
+def fmt_dur(h):
+    total_m = int(round(h * 60))
+    return f"{total_m // 60}h{total_m % 60:02d}m"
+
+
+def print_report(args):
+    log = run(["pmset", "-g", "log"])
+    samples = parse_samples(log)
+    if not samples:
+        print("No battery samples found in pmset log.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.days:
+        cutoff = samples[-1]["t"] - dt.timedelta(days=args.days)
+        samples = [s for s in samples if s["t"] >= cutoff]
+
+    sessions = build_sessions(samples)
+    health = parse_health(run(["system_profiler", "SPPowerDataType"]))
+
+    if args.json:
+        print(json.dumps(
+            {
+                "health": health,
+                "window": {
+                    "from": samples[0]["t"].isoformat(),
+                    "to": samples[-1]["t"].isoformat(),
+                    "samples": len(samples),
+                },
+                "sessions": [
+                    {
+                        "source": s["source"],
+                        "start": s["start"].isoformat(),
+                        "end": s["end"].isoformat(),
+                        "start_charge": s["start_charge"],
+                        "end_charge": s["end_charge"],
+                        "min_charge": s["min_charge"],
+                        "dur_h": round(s["dur_h"], 3),
+                        "delta": s["delta"],
+                        "rate": round(s["rate"], 2),
+                    }
+                    for s in sessions
+                ],
+                "daily": daily_rollup(sessions),
+            },
+            indent=2,
+        ))
+        return
+
+    show_all = not (args.sessions or args.daily or args.graph)
+
+    # Header / health
+    a = health.get("adapter", {})
+    print("=" * 66)
+    print("  BATTERY HISTORY")
+    print("=" * 66)
+    print(f"  Now:        {health.get('charge', '?')}%  "
+          f"(charging: {health.get('charging', '?')}, "
+          f"full: {health.get('fully_charged', '?')})")
+    print(f"  Health:     {health.get('max_capacity', '?')} max capacity, "
+          f"{health.get('cycle_count', '?')} cycles, "
+          f"condition {health.get('condition', '?')}")
+    ad = "not connected"
+    if a.get("connected") == "Yes":
+        ad = f"{a.get('name', 'adapter')} ({a.get('wattage', '?')}W)"
+    print(f"  Adapter:    {ad}")
+    print(f"  Window:     {samples[0]['t']:%Y-%m-%d %H:%M} -> "
+          f"{samples[-1]['t']:%Y-%m-%d %H:%M}  "
+          f"({len(samples)} samples)")
+    print()
+
+    if show_all or args.graph:
+        chart, src = sparkline(samples)
+        print("  Charge % over window (▁ empty .. █ full):")
+        print("  " + chart)
+        print("  " + src + "   (A=on adapter, B=on battery)")
+        print()
+
+    if show_all or args.daily:
+        days = daily_rollup(sessions)
+        print("  Per-day battery use:")
+        print("  {:<12} {:>9} {:>9} {:>7} {:>7}".format(
+            "day", "on-batt", "drained", "min%", "max%"))
+        for day in sorted(days):
+            d = days[day]
+            print("  {:<12} {:>9} {:>8}% {:>6}% {:>6}%".format(
+                day,
+                fmt_dur(d["batt_h"]) if d["batt_h"] else "-",
+                int(round(d["drained"])) if d["drained"] else 0,
+                d["min"], d["max"]))
+        print()
+
+    if show_all or args.sessions:
+        batt = [s for s in sessions if s["source"] == "Batt"
+                and s["dur_h"] * 60 >= 1]
+        limit = args.limit if args.sessions else 12
+        recent = batt[-limit:]
+        print(f"  Battery (discharge) sessions "
+              f"[last {len(recent)} of {len(batt)}]:")
+        print("  {:<16} {:>7} {:>10} {:>10}".format(
+            "start", "length", "charge", "drain/hr"))
+        for s in recent:
+            print("  {:<16} {:>7} {:>10} {:>9.1f}%".format(
+                f"{s['start']:%m-%d %H:%M}",
+                fmt_dur(s["dur_h"]),
+                f"{s['start_charge']}->{s['end_charge']}%",
+                s["rate"]))
+        if batt:
+            drains = [-s["rate"] for s in batt if s["rate"] < 0]
+            if drains:
+                print()
+                print(f"  Avg drain rate on battery: "
+                      f"{sum(drains) / len(drains):.1f}%/hr")
+        print()
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Historical battery usage for macOS "
+                    "(from pmset + system_profiler).")
+    p.add_argument("--days", type=int, default=0,
+                   help="limit to the last N days of history")
+    p.add_argument("--sessions", action="store_true",
+                   help="show only discharge sessions")
+    p.add_argument("--daily", action="store_true",
+                   help="show only the per-day table")
+    p.add_argument("--graph", action="store_true",
+                   help="show only the charge sparkline")
+    p.add_argument("--limit", type=int, default=20,
+                   help="max sessions to list with --sessions")
+    p.add_argument("--json", action="store_true",
+                   help="emit machine-readable JSON")
+    args = p.parse_args()
+    print_report(args)
+
+
+if __name__ == "__main__":
+    main()
