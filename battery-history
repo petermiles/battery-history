@@ -11,6 +11,7 @@ macOS power management writes to its log.
 
 import argparse
 import datetime as dt
+import html
 import json
 import re
 import subprocess
@@ -217,6 +218,10 @@ def print_report(args):
     sessions = build_sessions(samples)
     health = parse_health(run(["system_profiler", "SPPowerDataType"]))
 
+    if args.html:
+        sys.stdout.write(html_report(samples, sessions, health, daily_rollup(samples)))
+        return
+
     if args.json:
         print(json.dumps(
             {
@@ -313,12 +318,262 @@ def print_report(args):
         print()
 
 
+HTML_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Battery History</title>
+<style>
+  :root{
+    --bg:#0f1216; --panel:#161b22; --panel2:#1b212b; --border:#262c36;
+    --text:#e6e9ee; --muted:#9aa4b2; --dim:#6b7482;
+    --blue:#60a5fa; --green:#34d399; --amber:#fbbf24; --red:#f87171;
+    --sleep:#39414d;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased;}
+  .wrap{max-width:960px;margin:0 auto;padding:40px 24px 64px}
+  h1{font-size:22px;font-weight:650;letter-spacing:-.01em;margin:0}
+  .subtitle{color:var(--muted);margin:4px 0 28px;font-size:13px}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:28px}
+  .card{background:var(--panel);border:1px solid var(--border);
+    border-radius:14px;padding:16px 18px}
+  .card .k{color:var(--muted);font-size:12px;text-transform:uppercase;
+    letter-spacing:.04em}
+  .card .v{font-size:30px;font-weight:650;margin-top:6px;letter-spacing:-.02em}
+  .card .v.small{font-size:16px;font-weight:550;margin-top:10px}
+  .card .sub{color:var(--dim);font-size:12px;margin-top:6px}
+  .bar{height:8px;border-radius:99px;background:var(--panel2);
+    margin-top:12px;overflow:hidden}
+  .bar span{display:block;height:100%;border-radius:99px}
+  .bar .green{background:var(--green)} .bar .amber{background:var(--amber)}
+  .bar .red{background:var(--red)}
+  .panel{background:var(--panel);border:1px solid var(--border);
+    border-radius:14px;padding:20px;margin-bottom:24px}
+  .panel h2{font-size:13px;font-weight:600;color:var(--muted);
+    text-transform:uppercase;letter-spacing:.04em;margin:0 0 14px}
+  .chart{width:100%;height:auto;display:block}
+  .chart .grid{stroke:#232a33;stroke-width:1}
+  .chart .axis{fill:var(--dim);font-size:11px;font-family:ui-monospace,monospace}
+  .chart .area{fill:var(--blue);opacity:.12}
+  .chart .line{fill:none;stroke:var(--blue);stroke-width:2;
+    stroke-linejoin:round;stroke-linecap:round}
+  .chart .band{opacity:.9}
+  .chart .band.ac{fill:var(--green)} .chart .band.batt{fill:var(--amber)}
+  .chart .band.sleep{fill:var(--sleep)}
+  .legend{display:flex;gap:18px;margin-top:12px;color:var(--muted);font-size:12px}
+  .legend i{display:inline-block;width:12px;height:12px;border-radius:3px;
+    margin-right:6px;vertical-align:-1px}
+  .legend .ac{background:var(--green)} .legend .batt{background:var(--amber)}
+  .legend .sleep{background:var(--sleep)}
+  table{width:100%;border-collapse:collapse}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--border)}
+  th{color:var(--muted);font-size:11px;text-transform:uppercase;
+    letter-spacing:.04em;font-weight:600}
+  tr:last-child td{border-bottom:none}
+  td.right,th.right{text-align:right}
+  td.dim{color:var(--dim)}
+  .mini{display:inline-block;width:60px;height:6px;border-radius:99px;
+    background:var(--panel2);margin-left:8px;overflow:hidden;vertical-align:1px}
+  .mini>span{display:block;height:100%;background:var(--blue)}
+  .mini.amber>span{background:var(--amber)}
+  .mini.red>span{background:var(--red)}
+  .callout{font-size:13px;color:var(--muted)}
+  .callout b{color:var(--text);font-size:16px}
+  footer{color:var(--dim);font-size:12px;margin-top:8px;text-align:center}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Battery History</h1>
+    <div class="subtitle">__SUBTITLE__</div>
+    <div class="cards">__CARDS__</div>
+
+    <div class="panel">
+      <h2>Charge over time</h2>
+      __CHART__
+      <div class="legend">
+        <span><i class="ac"></i>On adapter</span>
+        <span><i class="batt"></i>On battery</span>
+        <span><i class="sleep"></i>Asleep / no data</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Per-day battery use</h2>
+      <table>
+        <thead><tr>
+          <th>Day</th><th class="right">On battery</th>
+          <th class="right">Drained</th><th class="right">Min</th>
+          <th class="right">Max</th>
+        </tr></thead>
+        <tbody>__DAILY__</tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h2>Discharge sessions (last __NSESS__)</h2>
+      <table>
+        <thead><tr>
+          <th>Start</th><th class="right">Length</th>
+          <th class="right">Charge</th><th class="right">Drain rate</th>
+        </tr></thead>
+        <tbody>__SESSIONS__</tbody>
+      </table>
+      <div class="callout" style="margin-top:14px">
+        Average drain on battery: <b>__AVG__%/hr</b>
+      </div>
+    </div>
+
+    <footer>Generated __GENERATED__ &middot; pmset + system_profiler</footer>
+  </div>
+</body>
+</html>
+"""
+
+
+def _svg_chart(samples, width=960, height=300):
+    pad_l, pad_r, pad_t, pad_b = 46, 14, 16, 40
+    pw, ph = width - pad_l - pad_r, height - pad_t - pad_b
+    t0, t1 = samples[0]["t"], samples[-1]["t"]
+    span = (t1 - t0).total_seconds() or 1
+
+    def X(t):
+        return pad_l + (t - t0).total_seconds() / span * pw
+
+    def Y(c):
+        return pad_t + (1 - c / 100.0) * ph
+
+    parts = []
+    for c in (0, 25, 50, 75, 100):
+        y = Y(c)
+        parts.append(
+            f'<line class="grid" x1="{pad_l:.1f}" y1="{y:.1f}" '
+            f'x2="{pad_l + pw:.1f}" y2="{y:.1f}"/>')
+        parts.append(
+            f'<text class="axis" x="{pad_l - 8:.1f}" y="{y + 3:.1f}" '
+            f'text-anchor="end">{c}</text>')
+
+    band_y = pad_t + ph + 7
+    for a, b in zip(samples, samples[1:]):
+        x1, x2 = X(a["t"]), X(b["t"])
+        if x2 - x1 < 0.05:
+            continue
+        gap_h = (b["t"] - a["t"]).total_seconds() / 3600.0
+        cls = ("sleep" if gap_h > SLEEP_GAP_H
+               else "ac" if a["source"] == "AC" else "batt")
+        parts.append(
+            f'<rect class="band {cls}" x="{x1:.1f}" y="{band_y:.1f}" '
+            f'width="{x2 - x1:.1f}" height="9"/>')
+
+    pts = " ".join(f"{X(s['t']):.1f},{Y(s['charge']):.1f}" for s in samples)
+    area = f"{X(t0):.1f},{Y(0):.1f} " + pts + f" {X(t1):.1f},{Y(0):.1f}"
+    parts.append(f'<polygon class="area" points="{area}"/>')
+    parts.append(f'<polyline class="line" points="{pts}"/>')
+
+    seen = set()
+    for s in samples:
+        d = s["t"].date()
+        if d in seen:
+            continue
+        seen.add(d)
+        x = X(dt.datetime.combine(d, dt.time.min, tzinfo=t0.tzinfo))
+        x = max(pad_l, min(pad_l + pw, x))
+        parts.append(
+            f'<text class="axis" x="{x:.1f}" y="{height - 10:.1f}" '
+            f'text-anchor="middle">{d:%m-%d}</text>')
+
+    return (f'<svg viewBox="0 0 {width} {height}" class="chart" role="img">'
+            + "".join(parts) + "</svg>")
+
+
+def html_report(samples, sessions, health, days):
+    a = health.get("adapter", {})
+    now = health.get("charge", "?")
+    try:
+        lvl = int(str(now))
+    except ValueError:
+        lvl = 0
+    lvl_cls = "red" if lvl <= 20 else "amber" if lvl <= 50 else "green"
+    charging = health.get("charging", "?")
+    connected = a.get("connected") == "Yes"
+    adapter = (f"{a.get('name', 'Adapter')} ({a.get('wattage', '?')}W)"
+               if connected else "Not connected")
+    state = ("Charging" if charging == "Yes"
+             else "Idle on adapter" if connected else "On battery")
+
+    cards = (
+        '<div class="card"><div class="k">Now</div>'
+        f'<div class="v">{now}%</div>'
+        f'<div class="bar"><span class="{lvl_cls}" style="width:{lvl}%"></span></div>'
+        f'<div class="sub">{state}</div></div>'
+        '<div class="card"><div class="k">Battery health</div>'
+        f'<div class="v">{html.escape(str(health.get("max_capacity", "?")))}</div>'
+        f'<div class="sub">{html.escape(str(health.get("cycle_count", "?")))} cycles &middot; '
+        f'{html.escape(str(health.get("condition", "?")))}</div></div>'
+        '<div class="card"><div class="k">Power source</div>'
+        f'<div class="v small">{html.escape(adapter)}</div>'
+        f'<div class="sub">{len(samples)} samples</div></div>')
+
+    batt = [s for s in sessions
+            if s["source"] == "Batt" and s["delta"] < 0 and s["dur_h"] * 60 >= 1]
+    drains = [-s["rate"] for s in batt]
+    avg = sum(drains) / len(drains) if drains else 0.0
+    max_rate = max(drains) if drains else 1
+    max_batt = max((d["batt_h"] for d in days.values()), default=0) or 1
+
+    daily_rows = []
+    for day in sorted(days):
+        d = days[day]
+        dr = int(round(d["drained"]))
+        bh = fmt_dur(d["batt_h"]) if d["batt_h"] else "\u2014"
+        bw = min(100, d["batt_h"] / max_batt * 100)
+        daily_rows.append(
+            f'<tr><td class="mono">{day}</td>'
+            f'<td class="mono right">{bh}<span class="mini">'
+            f'<span style="width:{bw:.0f}%"></span></span></td>'
+            f'<td class="mono right">{dr}%<span class="mini amber">'
+            f'<span style="width:{min(100, dr):.0f}%"></span></span></td>'
+            f'<td class="mono right dim">{d["min"]}%</td>'
+            f'<td class="mono right dim">{d["max"]}%</td></tr>')
+
+    sess_rows = []
+    for s in batt[-20:]:
+        rate = -s["rate"]
+        rw = min(100, rate / max_rate * 100)
+        sess_rows.append(
+            f'<tr><td class="mono">{s["start"]:%m-%d %H:%M}</td>'
+            f'<td class="mono right">{fmt_dur(s["dur_h"])}</td>'
+            f'<td class="mono right">{s["start_charge"]}\u2192{s["end_charge"]}%</td>'
+            f'<td class="mono right">-{rate:.1f}%/hr<span class="mini red">'
+            f'<span style="width:{rw:.0f}%"></span></span></td></tr>')
+
+    return (HTML_TEMPLATE
+            .replace("__SUBTITLE__",
+                     f"{samples[0]['t']:%b %-d, %H:%M} \u2192 "
+                     f"{samples[-1]['t']:%b %-d, %H:%M}  "
+                     f"({len(samples)} samples)")
+            .replace("__CARDS__", cards)
+            .replace("__CHART__", _svg_chart(samples))
+            .replace("__DAILY__", "".join(daily_rows))
+            .replace("__NSESS__", str(len(batt)))
+            .replace("__SESSIONS__", "".join(sess_rows)
+                     or '<tr><td colspan="4" class="dim">No discharge sessions</td></tr>')
+            .replace("__AVG__", f"{avg:.1f}")
+            .replace("__GENERATED__", f"{dt.datetime.now():%Y-%m-%d %H:%M}"))
+
+
+
 def main():
     p = argparse.ArgumentParser(
         description="Historical battery usage for macOS "
                     "(from pmset + system_profiler).")
-    p.add_argument("--days", type=int, default=0,
-                   help="limit to the last N days of history")
+    p.add_argument("--days", type=int, default=30,
+                   help="limit to the last N days of history (0 = all)")
     p.add_argument("--sessions", action="store_true",
                    help="show only discharge sessions")
     p.add_argument("--daily", action="store_true",
@@ -329,6 +584,8 @@ def main():
                    help="max sessions to list with --sessions")
     p.add_argument("--json", action="store_true",
                    help="emit machine-readable JSON")
+    p.add_argument("--html", action="store_true",
+                   help="emit a self-contained HTML report")
     args = p.parse_args()
     print_report(args)
 
