@@ -23,6 +23,11 @@ SAMPLE_RE = re.compile(
 
 BLOCKS = " ▁▂▃▄▅▆▇█"
 
+# macOS logs a 'Using AC/Batt' line only on a power event. A gap longer
+# than this between two samples means no events (sleep/off), not runtime,
+# so it is not counted as on-battery time and it ends the current session.
+SLEEP_GAP_H = 1.0
+
 
 def run(cmd):
     try:
@@ -53,11 +58,17 @@ def parse_samples(text):
 
 
 def build_sessions(samples):
-    """Group consecutive samples that share a power source."""
+    """Group consecutive same-source samples into sessions.
+
+    A gap longer than SLEEP_GAP_H means the machine was asleep or off, not
+    running. Such a gap ends the current session so sleep is never counted."""
     sessions = []
     cur = None
+    prev_t = None
     for s in samples:
-        if cur is None or s["source"] != cur["source"]:
+        gap_h = (s["t"] - prev_t).total_seconds() / 3600.0 if prev_t else 0.0
+        prev_t = s["t"]
+        if cur is None or s["source"] != cur["source"] or gap_h > SLEEP_GAP_H:
             if cur is not None:
                 sessions.append(cur)
             cur = {
@@ -115,25 +126,44 @@ def parse_health(text):
     return health
 
 
-def daily_rollup(sessions):
-    """Per calendar day: time on battery, % drained, min charge."""
+def daily_rollup(samples):
+    """Per calendar day: awake time on battery and % drained.
+
+    Time is summed interval by interval between consecutive samples. A gap
+    longer than SLEEP_GAP_H is sleep and is skipped. Each interval is credited
+    to the calendar day(s) it covers, so no day can exceed 24 hours."""
     days = {}
-    for se in sessions:
-        day = se["start"].date().isoformat()
-        d = days.setdefault(
-            day,
-            {"batt_h": 0.0, "drained": 0.0, "charged": 0.0,
-             "min": 100, "max": 0},
-        )
-        d["min"] = min(d["min"], se["min_charge"])
-        d["max"] = max(d["max"], se["max_charge"])
-        if se["source"] == "Batt":
-            d["batt_h"] += se["dur_h"]
-            if se["delta"] < 0:
-                d["drained"] += -se["delta"]
-        else:
-            if se["delta"] > 0:
-                d["charged"] += se["delta"]
+
+    def day(ds):
+        return days.setdefault(
+            ds, {"batt_h": 0.0, "drained": 0.0, "charged": 0.0,
+                 "min": 100, "max": 0})
+
+    for s in samples:
+        d = day(s["t"].date().isoformat())
+        d["min"] = min(d["min"], s["charge"])
+        d["max"] = max(d["max"], s["charge"])
+
+    for a, b in zip(samples, samples[1:]):
+        gap_h = (b["t"] - a["t"]).total_seconds() / 3600.0
+        if gap_h <= 0 or gap_h > SLEEP_GAP_H:
+            continue
+        drop = a["charge"] - b["charge"]
+        seg_start = a["t"]
+        while seg_start < b["t"]:
+            midnight = dt.datetime.combine(
+                seg_start.date() + dt.timedelta(days=1),
+                dt.time.min, tzinfo=seg_start.tzinfo)
+            seg_end = min(b["t"], midnight)
+            seg_h = (seg_end - seg_start).total_seconds() / 3600.0
+            d = day(seg_start.date().isoformat())
+            if a["source"] == "Batt":
+                d["batt_h"] += seg_h
+                if drop > 0:
+                    d["drained"] += drop * (seg_h / gap_h)
+            elif drop < 0:
+                d["charged"] += -drop * (seg_h / gap_h)
+            seg_start = seg_end
     return days
 
 
@@ -210,7 +240,7 @@ def print_report(args):
                     }
                     for s in sessions
                 ],
-                "daily": daily_rollup(sessions),
+                "daily": daily_rollup(samples),
             },
             indent=2,
         ))
@@ -246,7 +276,7 @@ def print_report(args):
         print()
 
     if show_all or args.daily:
-        days = daily_rollup(sessions)
+        days = daily_rollup(samples)
         print("  Per-day battery use:")
         print("  {:<12} {:>9} {:>9} {:>7} {:>7}".format(
             "day", "on-batt", "drained", "min%", "max%"))
@@ -261,7 +291,7 @@ def print_report(args):
 
     if show_all or args.sessions:
         batt = [s for s in sessions if s["source"] == "Batt"
-                and s["dur_h"] * 60 >= 1]
+                and s["delta"] < 0 and s["dur_h"] * 60 >= 1]
         limit = args.limit if args.sessions else 12
         recent = batt[-limit:]
         print(f"  Battery (discharge) sessions "
