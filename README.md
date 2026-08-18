@@ -18,10 +18,10 @@ Run it straight from GitHub:
 curl -fsSL https://raw.githubusercontent.com/petermiles/battery-history/main/battery-history | python3
 ```
 
-When output is piped or redirected, the report goes to stdout so you can save it:
+To save the report to a file instead of opening it, use `--stdout`:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/petermiles/battery-history/main/battery-history | python3 - > battery.html
+curl -fsSL https://raw.githubusercontent.com/petermiles/battery-history/main/battery-history | python3 - --stdout > battery.html
 ```
 
 Put it on your `PATH` to call it by name:

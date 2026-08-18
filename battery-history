@@ -231,10 +231,9 @@ def print_report(args):
     progress("Building HTML report…")
     doc = html_report(samples, sessions, health, daily)
 
-    # Piped or redirected (e.g. `... | python3 - > report.html`): write to
-    # stdout. An interactive terminal instead gets the report as a file that
-    # opens in the browser, never a wall of HTML.
-    if args.stdout or not sys.stdout.isatty():
+    # Only --stdout emits raw HTML (for saving with `> report.html`). Otherwise
+    # always write the report to a file and open it in the browser.
+    if args.stdout:
         sys.stdout.write(doc)
         return
 
