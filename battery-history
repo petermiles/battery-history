@@ -13,16 +13,17 @@ import argparse
 import datetime as dt
 import html
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 
 SAMPLE_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) ([-+]\d{4}).*?"
     r"Using (AC|Batt)\(Charge:\s*(\d+)"
 )
 
-BLOCKS = " ▁▂▃▄▅▆▇█"
 
 # macOS logs a 'Using AC/Batt' line only on a power event. A gap longer
 # than this between two samples means no events (sleep/off), not runtime,
@@ -168,35 +169,6 @@ def daily_rollup(samples):
     return days
 
 
-def sparkline(samples, width=60):
-    if not samples:
-        return "", ""
-    start = samples[0]["t"]
-    end = samples[-1]["t"]
-    span = (end - start).total_seconds() or 1
-    buckets = [[] for _ in range(width)]
-    srcbuckets = [[] for _ in range(width)]
-    for s in samples:
-        idx = int((s["t"] - start).total_seconds() / span * (width - 1))
-        idx = max(0, min(width - 1, idx))
-        buckets[idx].append(s["charge"])
-        srcbuckets[idx].append(s["source"])
-    charge_row = []
-    src_row = []
-    last = 0
-    for i in range(width):
-        if buckets[i]:
-            avg = sum(buckets[i]) / len(buckets[i])
-            last = avg
-        else:
-            avg = last
-        level = int(round(avg / 100 * (len(BLOCKS) - 1)))
-        charge_row.append(BLOCKS[level])
-        if srcbuckets[i]:
-            src_row.append("A" if srcbuckets[i][-1] == "AC" else "B")
-        else:
-            src_row.append(" ")
-    return "".join(charge_row), "".join(src_row)
 
 
 def fmt_dur(h):
@@ -204,9 +176,15 @@ def fmt_dur(h):
     return f"{total_m // 60}h{total_m % 60:02d}m"
 
 
+def progress(msg):
+    print(f"\u2192 {msg}", file=sys.stderr, flush=True)
+
+
 def print_report(args):
+    progress("Reading power log (pmset)…")
     log = run(["pmset", "-g", "log"])
     samples = parse_samples(log)
+    progress(f"Parsed {len(samples)} charge samples")
     if not samples:
         print("No battery samples found in pmset log.", file=sys.stderr)
         sys.exit(1)
@@ -216,11 +194,10 @@ def print_report(args):
         samples = [s for s in samples if s["t"] >= cutoff]
 
     sessions = build_sessions(samples)
+    progress("Reading battery health (system_profiler)…")
     health = parse_health(run(["system_profiler", "SPPowerDataType"]))
 
-    if args.html:
-        sys.stdout.write(html_report(samples, sessions, health, daily_rollup(samples)))
-        return
+    daily = daily_rollup(samples)
 
     if args.json:
         print(json.dumps(
@@ -245,77 +222,29 @@ def print_report(args):
                     }
                     for s in sessions
                 ],
-                "daily": daily_rollup(samples),
+                "daily": daily,
             },
             indent=2,
         ))
         return
 
-    show_all = not (args.sessions or args.daily or args.graph)
+    progress("Building HTML report…")
+    doc = html_report(samples, sessions, health, daily)
 
-    # Header / health
-    a = health.get("adapter", {})
-    print("=" * 66)
-    print("  BATTERY HISTORY")
-    print("=" * 66)
-    print(f"  Now:        {health.get('charge', '?')}%  "
-          f"(charging: {health.get('charging', '?')}, "
-          f"full: {health.get('fully_charged', '?')})")
-    print(f"  Health:     {health.get('max_capacity', '?')} max capacity, "
-          f"{health.get('cycle_count', '?')} cycles, "
-          f"condition {health.get('condition', '?')}")
-    ad = "not connected"
-    if a.get("connected") == "Yes":
-        ad = f"{a.get('name', 'adapter')} ({a.get('wattage', '?')}W)"
-    print(f"  Adapter:    {ad}")
-    print(f"  Window:     {samples[0]['t']:%Y-%m-%d %H:%M} -> "
-          f"{samples[-1]['t']:%Y-%m-%d %H:%M}  "
-          f"({len(samples)} samples)")
-    print()
+    # Piped or redirected (e.g. `... | python3 - > report.html`): write to
+    # stdout. An interactive terminal instead gets the report as a file that
+    # opens in the browser, never a wall of HTML.
+    if args.stdout or not sys.stdout.isatty():
+        sys.stdout.write(doc)
+        return
 
-    if show_all or args.graph:
-        chart, src = sparkline(samples)
-        print("  Charge % over window (▁ empty .. █ full):")
-        print("  " + chart)
-        print("  " + src + "   (A=on adapter, B=on battery)")
-        print()
+    out = os.path.join(tempfile.gettempdir(), "battery-history.html")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(doc)
+    progress(f"Wrote {out}")
+    progress("Opening in browser…")
+    subprocess.run(["open", out], check=False)
 
-    if show_all or args.daily:
-        days = daily_rollup(samples)
-        print("  Per-day battery use:")
-        print("  {:<12} {:>9} {:>9} {:>7} {:>7}".format(
-            "day", "on-batt", "drained", "min%", "max%"))
-        for day in sorted(days):
-            d = days[day]
-            print("  {:<12} {:>9} {:>8}% {:>6}% {:>6}%".format(
-                day,
-                fmt_dur(d["batt_h"]) if d["batt_h"] else "-",
-                int(round(d["drained"])) if d["drained"] else 0,
-                d["min"], d["max"]))
-        print()
-
-    if show_all or args.sessions:
-        batt = [s for s in sessions if s["source"] == "Batt"
-                and s["delta"] < 0 and s["dur_h"] * 60 >= 1]
-        limit = args.limit if args.sessions else 12
-        recent = batt[-limit:]
-        print(f"  Battery (discharge) sessions "
-              f"[last {len(recent)} of {len(batt)}]:")
-        print("  {:<16} {:>7} {:>10} {:>10}".format(
-            "start", "length", "charge", "drain/hr"))
-        for s in recent:
-            print("  {:<16} {:>7} {:>10} {:>9.1f}%".format(
-                f"{s['start']:%m-%d %H:%M}",
-                fmt_dur(s["dur_h"]),
-                f"{s['start_charge']}->{s['end_charge']}%",
-                s["rate"]))
-        if batt:
-            drains = [-s["rate"] for s in batt if s["rate"] < 0]
-            if drains:
-                print()
-                print(f"  Avg drain rate on battery: "
-                      f"{sum(drains) / len(drains):.1f}%/hr")
-        print()
 
 
 HTML_TEMPLATE = """<!doctype html>
@@ -574,18 +503,10 @@ def main():
                     "(from pmset + system_profiler).")
     p.add_argument("--days", type=int, default=30,
                    help="limit to the last N days of history (0 = all)")
-    p.add_argument("--sessions", action="store_true",
-                   help="show only discharge sessions")
-    p.add_argument("--daily", action="store_true",
-                   help="show only the per-day table")
-    p.add_argument("--graph", action="store_true",
-                   help="show only the charge sparkline")
-    p.add_argument("--limit", type=int, default=20,
-                   help="max sessions to list with --sessions")
+    p.add_argument("--stdout", action="store_true",
+                   help="write the HTML report to stdout instead of opening it")
     p.add_argument("--json", action="store_true",
                    help="emit machine-readable JSON")
-    p.add_argument("--html", action="store_true",
-                   help="emit a self-contained HTML report")
     args = p.parse_args()
     print_report(args)
 
